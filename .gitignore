@@ -1,5 +1,15 @@
+# Data files
+data/
+*.zip
+*.mp4
+*.avi
+*.png
+*.jpg
+
+# Python clutter
 __pycache__/
 *.pyc
-.env
-venv/
 .ipynb_checkpoints/
+
+# Environment
+.env
