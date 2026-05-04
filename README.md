@@ -1,4 +1,4 @@
-# PAMASA — Helbling Hackathon 2025
+# Trinity — Helbling Hackathon 2025
 Members: Sandro Coti, Matteo De Liquori, Paloma Spiess
 Image comparison and feature tracking challenge.
  
