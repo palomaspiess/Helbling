@@ -1,119 +1,199 @@
-# Trinity — Helbling Hackathon 2025
-Members: Sandro Coti, Matteo De Liquori, Paloma Spiess
-Image comparison and feature tracking challenge.
- 
+# Channel Position Detection — Hackathon
+
+Estimate the position of an object moving through a channel, frame by frame, based on video data.
+
+  Core challenge: Given video footage of an object (likely a probe or sensor) moving through a pipe/channel, estimate its position frame-by-frame using computer vision.
+                                                                                                                                                                                 
+  What you implement: A single method in mySolution/MovementPathEstimator.py that, for each video, returns:
+  - movement_path — position in meters per frame (0 → channel_length and back)
+  - turning_point — the frame where the object reverses direction
+  - movement_direction — +1 forward / -1 backward / 0 stationary per frame
+
+  The data: 11 videos (already extracted as frame images), each showing an object traveling through a channel of known physical length. Some videos have ground-truth labels
+  (distance_labels/), others are withheld for scoring.
+
+  Scoring: Turning point frame error, position MAE (normalized by channel length), and directional accuracy.
+
+  Context clues: The project name is "ChannelPositionDetection". This is about tracking a camera or probe moving through a sewage pipe or water channel infrastructure — a real-world inspection use case.
+
+  Bonus challenges (optional, but can gain points): Gravel, Lime deposit, Roots, drop location detection, channel geometry changes, visibility scoring, etc.
+
+  The starting point is a dummy triangle-wave implementation that you replace with actual computer vision logic.
+
+  **Important: all files you create and need must reside inside your 'mySolution' folder.**
 ---
- 
-## Project Structure
- 
-```
-hackathon/
-├── main.py
-├── load_data.py
-├── processing.py
-├── visualize.py
-├── requirements.txt
-├── .gitignore
-└── data/               ← local only, not tracked by Git
-    └── frames/
-```
- 
----
- 
-## Setup
- 
-**1. Create and activate the conda environment:**
+
+## Quick start
+
+### 1. Install Python 3.11+
+
+Download from [python.org](https://www.python.org/downloads/) and verify:
 ```bash
-conda create -n hackathon python=3.11
-conda activate hackathon
+python --version
 ```
- 
-**2. Install dependencies:**
+
+### 2. Install uv
+
 ```bash
-pip install -r requirements.txt
+pip install uv
 ```
- 
-**3. Place video data in the `data/` folder** (not tracked by Git — each person manages this locally)
- 
-**4. Run:**
+
+Or on Windows:
 ```bash
-python main.py
+winget install astral-sh.uv
 ```
- 
+
+### 3. Set up the workspace
+
+Clone or copy this repository, then navigate into the project folder:
+
+```bash
+cd ChannelPositionDetection
+```
+
+Install dependencies:
+
+```bash
+uv sync
+```
+
+### 4. Prepare the frame images
+
+videos_pw.zip: Password-protected ZIP archives can be downloaded here:
+
+https://www.swisstransfer.com/d/4525aee3-72f8-4a58-b2c0-e0d73fa00f8c
+
+
+You will receive a password-protected ZIP containing the videos. Extract it with the provided password so that the video files land in a `videos/` folder next to this README (not `videos_pw/`):
+
+```
+ChannelPositionDetection/
+└── videos/
+    ├── ...Test1.mp4
+    ├── ...Test2.mp4
+    └── ...
+```
+
+Then run the extraction script from the repo root:
+
+```bash
+python SETUP_frame_images_extraction/extract_frame_images.py
+```
+
+This downloads `ffmpeg` automatically (requires internet on first run), then extracts every frame from each video into `frame_images/1/`, `frame_images/2/`, … The script is idempotent — re-running it skips channels already extracted.
+
+For the bonus videos, extract the bonus ZIP into a `bonus_videos/` folder alongside `videos/`, then run:
+
+```bash
+python SETUP_frame_images_extraction/extract_bonus_frame_images.py
+```
+
 ---
- 
-## File Overview
- 
-### `main.py`
-Entry point for the pipeline. Controls the overall flow:
-1. Extract frames from video
-2. Load frames into memory
-3. Run processing pipeline
-4. Display results
-Update the `VIDEO_PATH` variable at the top to match the actual filename once we have the data.
- 
+
+## Your task
+
+Open `mySolution/MovementPathEstimator.py` and implement the method:
+
+```python
+def calculate_movement_path_and_turning_point(self, video_number, channel_length):
+```
+
+**Inputs:**
+- `video_number` — which video (1-based index)
+- `channel_length` — physical length of the channel in metres
+- `self.path_to_videos + str(video_number)` — folder containing the frame images (`0.png`, `1.png`, ...)
+
+**Return a tuple of three arrays:**
+- `movement_path` — `np.ndarray` shape `(N,)`, position in `[0, channel_length]` per frame
+- `turning_point` — `float`, frame index where the object reverses direction
+- `movement_direction` — `np.ndarray` shape `(N,)`, `+1` forward / `-1` backward / `0` stationary per frame
+
+The file already contains a dummy implementation (a simple triangle wave) as a starting point — replace it with your solution.
+
 ---
- 
-### `load_data.py`
-Handles all data loading and frame extraction from video files.
- 
-| Function | Description |
-|---|---|
-| `extract_frames(video_path, output_dir)` | Reads a video file and saves each frame as a `.png` image |
-| `load_frames(frames_dir)` | Loads all saved frames from a folder into a list of numpy arrays |
-| `load_single_frame(path)` | Loads one image from a file path |
- 
-> Frames are numpy arrays (standard format for OpenCV and scikit-image). BGR color format by default.
- 
+
+## Testing your solution
+
+Run a single video and see your score immediately:
+
+```bash
+uv run python estimate_single_movement_path.py
+```
+
+Change `video_num_to_test` at the top of the file to test a different video (1–11).
+
+To test all videos at once:
+
+```bash
+uv run python compare_estimators.py
+```
+
+**Scoring metrics:**
+| Metric | Direction | Description |
+|---|---|---|
+| TP error [frames] | lower is better | Absolute error on the turning point frame |
+| Path MAE [m] | lower is better | Mean absolute position error, normalized by channel length |
+| Dir accuracy | higher is better | Fraction of frames with correct movement direction |
+
 ---
- 
-### `processing.py`
-Core image processing logic. Contains multiple approaches — we pick whichever fits the actual task tomorrow.
- 
-| Function | Description |
-|---|---|
-| `run_pipeline(frames)` | Main pipeline — loops through frame pairs and runs comparison. Edit this to wire together whichever methods we need |
-| `compare_frames(frame_a, frame_b)` | Compares two frames — currently uses frame differencing, can be swapped out |
-| `to_grayscale(frame)` | Converts a BGR frame to grayscale (needed by most algorithms) |
-| `frame_difference(gray_a, gray_b)` | Computes absolute pixel difference between two frames — simplest comparison method |
-| `threshold_mask(diff, threshold)` | Applies a binary threshold to a difference image to isolate changed regions |
-| `similarity_score(gray_a, gray_b)` | Computes SSIM (Structural Similarity Index) — a perceptual similarity metric between 0 and 1 |
-| `detect_features(frame)` | Detects ORB keypoints and descriptors in a frame — used for feature tracking |
-| `match_features(desc_a, desc_b)` | Matches ORB descriptors between two frames to find corresponding features |
-| `optical_flow(gray_a, gray_b)` | Computes dense optical flow — tracks how pixels move between frames |
- 
+
+## Using `distance_labels/` as training data
+
+If you decide to create a ML-based solution, you may use  `distance_labels/` as training data. However, only a subset of the label files is provided — the rest are withheld as a **held-out test set** used by the organizers to score your solution. This prevents **overfitting**: if all labels were available, a model could simply memorize the exact output for each video rather than learning to generalize to unseen inputs.
+
+We do not necessary encourage you to create a ML-based solution. The training set might be too small. 
+
+Your solution must therefore work on any video, including ones for which no label file exists in `distance_labels/`.
+
 ---
- 
-### `visualize.py`
-Helper functions for displaying images and results. Call these anywhere for quick visual debugging.
- 
-| Function | Description |
-|---|---|
-| `show_results(results)` | Displays the first 5 results from the pipeline as a sanity check |
-| `show_image(image, title)` | Displays a single image using matplotlib |
-| `show_side_by_side(image_a, image_b)` | Displays two images next to each other for comparison |
-| `show_diff(diff)` | Displays a difference or mask image with a heatmap colormap |
-| `draw_keypoints(frame, keypoints)` | Draws detected ORB keypoints on a frame |
-| `draw_matches(frame_a, kp_a, frame_b, kp_b, matches)` | Draws feature matches between two frames |
-| `plot_scores(scores)` | Plots a list of per-frame scores as a line graph over time |
- 
----
- 
-## Key Libraries
- 
-| Library | Used for |
-|---|---|
-| `opencv-python` (cv2) | Video reading, frame extraction, feature detection, optical flow |
-| `scikit-image` (skimage) | SSIM similarity scoring, filters |
-| `numpy` | Array manipulation — all images are numpy arrays under the hood |
-| `matplotlib` | Plotting and image display |
-| `scipy` | Signal processing utilities |
-| `scikit-learn` | ML utilities if needed |
-| `Pillow` | General image loading/saving |
- 
----
- 
-## Notes
-- The `data/` folder is excluded from Git via `.gitignore` — each team member manages their own local copy of the data
-- All frames are stored as numpy arrays in BGR format (OpenCV default) — convert to RGB when using matplotlib: `cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)`
-- `processing.py` contains multiple approaches — `run_pipeline()` should be updated once we understand the exact task requirements
+
+## Repository structure
+
+```
+mySolution/
+  MovementPathEstimator.py   ← implement your solution here
+  results/                   ← output written here automatically
+frame_images/                ← copy separately, not in repo
+  {1..11}/                   ← video frames (0.png, 1.png, ...)
+distance_labels/             ← ground-truth position curves (for scoring only, see below)
+channel_lengths.npy          ← physical channel lengths per video
+EstimationRater.py           ← scoring framework (do not modify)
+MovementPath.py              ← data class (do not modify)
+estimate_single_movement_path.py   ← run & score one video
+compare_estimators.py              ← run & score all videos
+```
+
+## Additional Challenges
+
+Bonus videos are labeled with timestamped obstruction annotations (Gravel, Lime deposit, Sludge, Sand, Roots, Grease, Concrete; severity 1–3) and visibility events (No Vision (Lens covered / Splash Water / Under Water), No Obstruction). 
+
+Also additional detections you could attempt:
+
+  Position & motion (already covered)
+  - Movement path (position over time)
+  - Movement direction per frame
+
+  Channel events
+  - Drop locations — frame where the object is released / enters the channel
+  - Retrieval frame — where it exits or stops moving
+  - Stall zones — frames where motion pauses mid-channel (not a full reversal)
+
+  Water / flow conditions
+  - Flow direction (is water pushing the object forward or against it?)
+  - Flow speed estimate (how fast the object drifts when not actively moving)
+
+  Object / debris detection
+  - Dirty locations — frame ranges or positions where sediment, blockage, or debris is visible
+  - Blockage degree — how much of the channel cross-section is obstructed (0–100%)
+  - Object shape change — deformation or tumbling events
+
+  Channel geometry
+  - Junction detection — frames where the channel branches or joins another
+  - Diameter change — frames where the channel narrows or widens noticeably
+  - Inclination change — transition from flat to sloped section
+
+  Practical difficulty
+  - Visibility score per frame — how clear/murky the water is
+  - Camera shake / stabilization quality
+
+  The most tractable ones for a hackathon (clear ground truth, derivable from video alone) are probably drop location, stall zones, blockage degree, and dirty locations — these have obvious visual signatures and could be labeled from the same videos you already have.

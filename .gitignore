@@ -1,15 +1,6 @@
-# Data files
-data/
-*.zip
-*.mp4
-*.avi
-*.png
-*.jpg
-
-# Python clutter
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
-
-# Environment
-.env
+frame_images*
+*videos*
+frame_images.zip
+.idea
+*__pycache__*
+*.exe
