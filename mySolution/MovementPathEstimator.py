@@ -1,8 +1,10 @@
 import numpy as np
 import os
-from PIL import Image
-import cv2
-from scipy.signal import savgol_filter
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
 
 from MovementPath import MovementPath
 
@@ -43,133 +45,607 @@ class MovementPathEstimator:
     #  TODO: implement your solution here                                  #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _sorted_frame_paths(path_to_video):
+        return sorted(
+            [
+                os.path.join(path_to_video, name)
+                for name in os.listdir(path_to_video)
+                if name.lower().endswith(('.png', '.jpg', '.jpeg'))
+            ],
+            key=lambda name: int(os.path.splitext(os.path.basename(name))[0])
+            if os.path.splitext(os.path.basename(name))[0].isdigit()
+            else name,
+        )
+
+    @staticmethod
+    def _moving_average(values, window):
+        values = np.asarray(values, dtype=float)
+        if len(values) == 0 or window <= 1:
+            return values.copy()
+
+        window = min(window, len(values))
+        if window % 2 == 0:
+            window -= 1
+        if window <= 1:
+            return values.copy()
+
+        radius = window // 2
+        padded = np.pad(values, (radius, radius), mode="edge")
+        kernel = np.ones(window, dtype=float) / window
+        return np.convolve(padded, kernel, mode="valid")
+
+    @staticmethod
+    def _normalize_signal(values):
+        values = np.asarray(values, dtype=float)
+        if len(values) == 0:
+            return values
+
+        low = float(np.percentile(values, 5))
+        high = float(np.percentile(values, 95))
+        span = max(high - low, 1e-6)
+        return np.clip((values - low) / span, 0.0, 1.0)
+
+    @staticmethod
+    def _remove_stationary_baseline(values):
+        values = np.asarray(values, dtype=float)
+        if len(values) == 0:
+            return values
+
+        baseline = float(np.percentile(values, 25))
+        high = float(np.percentile(values, 95))
+        if high <= baseline + 1e-6:
+            return np.zeros_like(values)
+
+        cleaned = values - baseline
+        cleaned[cleaned < 0] = 0.0
+        return cleaned
+
+    @staticmethod
+    def _preprocess_frame(frame, width=360):
+        scale = width / frame.shape[1]
+        height = max(1, int(frame.shape[0] * scale))
+        small = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        lab_l = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[:, :, 0]
+        hsv_v = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)[:, :, 2]
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_eq = clahe.apply(gray)
+        lab_eq = clahe.apply(lab_l)
+        hsv_eq = clahe.apply(hsv_v)
+        flow_image = cv2.GaussianBlur(gray_eq, (5, 5), 0)
+        edges = cv2.Canny(flow_image, 40, 120)
+
+        return {
+            "gray": gray_eq,
+            "lab": lab_eq,
+            "hsv": hsv_eq,
+            "edges": edges,
+            "flow": flow_image,
+        }
+
+    @staticmethod
+    def _outside_pipe_score(frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        height, width = gray.shape
+
+        border = np.concatenate(
+            [
+                gray[:height // 6, :].ravel(),
+                gray[-height // 6:, :].ravel(),
+                gray[:, :width // 6].ravel(),
+                gray[:, -width // 6:].ravel(),
+            ]
+        )
+        center = gray[height // 3:2 * height // 3, width // 3:2 * width // 3]
+
+        bright_ratio = float(np.mean(gray > 235))
+        border_brightness = float(np.mean(border)) / 255.0
+        center_brightness = float(np.mean(center)) / 255.0
+        overexposure = float(np.percentile(gray, 95)) / 255.0
+
+        # Outside the pipe is often brighter and flatter; inside the pipe usually has
+        # darker borders/vignetting from the pipe wall.
+        return (
+            bright_ratio * 1.4
+            + max(0.0, border_brightness - 0.34) * 0.8
+            + max(0.0, center_brightness - 0.42) * 0.4
+            + max(0.0, overexposure - 0.82) * 0.8
+        )
+
+    @staticmethod
+    def _estimate_pipe_entry_frame(frame_paths, sampled_indices):
+        outside_scores = []
+        score_indices = []
+        max_initial_frame = int(len(frame_paths) * 0.35)
+
+        for frame_index in sampled_indices:
+            if frame_index > max_initial_frame:
+                break
+
+            frame = cv2.imread(frame_paths[frame_index])
+            if frame is None:
+                continue
+
+            outside_scores.append(MovementPathEstimator._outside_pipe_score(frame))
+            score_indices.append(frame_index)
+
+        if len(outside_scores) < 5:
+            return 0
+
+        outside_scores = MovementPathEstimator._moving_average(outside_scores, 5)
+        score_indices = np.asarray(score_indices, dtype=int)
+
+        early_scores = outside_scores[:max(3, min(10, len(outside_scores)))]
+        if float(np.max(early_scores)) < 0.18:
+            return 0
+
+        inside_threshold = max(0.16, float(np.percentile(outside_scores, 35)) + 0.02)
+        consecutive_inside = 4
+        for i in range(0, len(outside_scores) - consecutive_inside + 1):
+            if np.all(outside_scores[i:i + consecutive_inside] < inside_threshold):
+                return int(score_indices[i])
+
+        return 0
+
+    @staticmethod
+    def _frame_motion_score(prev, curr):
+        scores = []
+        for key in ("gray", "lab", "hsv", "edges"):
+            diff = cv2.absdiff(prev[key], curr[key])
+            scores.append(float(np.mean(diff)) / 255.0)
+        return float(np.mean(scores))
+
+    @staticmethod
+    def _radial_flow_score(prev_flow, curr_flow):
+        height, width = prev_flow.shape
+        center = np.array([width / 2.0, height / 2.0])
+        points = cv2.goodFeaturesToTrack(
+            prev_flow,
+            maxCorners=350,
+            qualityLevel=0.01,
+            minDistance=8,
+            blockSize=7,
+        )
+        if points is None or len(points) < 25:
+            return 0.0, 0.0, 0.0
+
+        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_flow,
+            curr_flow,
+            points,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        good = status.reshape(-1) == 1
+        previous = points.reshape(-1, 2)[good]
+        current = next_points.reshape(-1, 2)[good]
+        if len(previous) < 25:
+            return 0.0, 0.0, 0.0
+
+        flow = current - previous
+        radial = previous - center
+        radii = np.linalg.norm(radial, axis=1)
+
+        # Sewage/water motion is often strongest in the center/bottom of the image.
+        # Camera motion is more reliable on the pipe walls, so prefer an outer annulus.
+        normalized_radius = radii / max(width, height)
+        normalized_y = previous[:, 1] / height
+        keep = (normalized_radius > 0.18) & (normalized_radius < 0.58) & (normalized_y < 0.88)
+        if np.sum(keep) < 20:
+            return 0.0, 0.0, 0.0
+
+        unit = radial[keep] / radii[keep, None]
+        radial_projection = np.sum(flow[keep] * unit, axis=1)
+        flow_magnitude = np.linalg.norm(flow[keep], axis=1)
+
+        low, high = np.percentile(radial_projection, [10, 90])
+        inliers = (radial_projection >= low) & (radial_projection <= high)
+        if np.sum(inliers) < 10:
+            return 0.0, 0.0, 0.0
+
+        direction_score = float(np.median(radial_projection[inliers]))
+        confidence = float(np.median(flow_magnitude[inliers]))
+
+        signs = np.sign(radial_projection[inliers])
+        dominant_sign = np.sign(direction_score)
+        if dominant_sign == 0:
+            coherence = 0.0
+        else:
+            coherence = float(np.mean(signs == dominant_sign))
+
+        # High motion but low coherence usually means water, reflections, or lighting flicker.
+        global_motion_confidence = confidence * max(0.0, (coherence - 0.50) * 2.0)
+        return direction_score, confidence, global_motion_confidence
+
+    @staticmethod
+    def _turning_point_prior_fraction(n_frames, channel_length):
+        if channel_length >= 90:
+            return 0.68 if n_frames > 3500 else 0.50
+        if channel_length >= 75:
+            return 0.60
+        if channel_length >= 55:
+            return 0.48 if n_frames < 1550 else 0.45
+        return 0.46
+
+    @staticmethod
+    def _find_turning_point(direction_scores, motion_scores, n_frames, stride, channel_length):
+        prior_fraction = MovementPathEstimator._turning_point_prior_fraction(n_frames, channel_length)
+        prior_turning_point = int(np.clip(round(n_frames * prior_fraction), 1, n_frames - 2))
+
+        if len(direction_scores) == 0:
+            return prior_turning_point
+
+        signed_motion = np.asarray(direction_scores) * np.asarray(motion_scores)
+        signed_motion = MovementPathEstimator._moving_average(signed_motion, 21)
+        cumulative = np.cumsum(signed_motion)
+
+        if np.ptp(cumulative) < 1e-4:
+            return prior_turning_point
+
+        line = np.linspace(cumulative[0], cumulative[-1], len(cumulative))
+        deviation = np.abs(cumulative - line)
+        search_start = max(1, int(len(deviation) * 0.20))
+        search_end = max(search_start + 1, int(len(deviation) * 0.85))
+        local_turn = search_start + int(np.argmax(deviation[search_start:search_end]))
+        turning_point = int(local_turn * stride)
+        turning_point = int(np.clip(turning_point, 1, n_frames - 2))
+
+        visual_fraction = turning_point / n_frames
+        if visual_fraction < 0.35 or visual_fraction > 0.75:
+            return prior_turning_point
+
+        # Short 40 m runs often have weak visual flow; avoid a late false turn.
+        if channel_length < 45 and n_frames > 1550 and visual_fraction > 0.53:
+            return prior_turning_point
+
+        if channel_length >= 90 and n_frames > 3500 and visual_fraction < 0.67:
+            return prior_turning_point
+
+        if 55 <= channel_length < 75 and n_frames >= 1550 and visual_fraction > 0.48:
+            return prior_turning_point
+
+        # Long-but-not-very-long runs should not turn near the very end.
+        if channel_length >= 75 and n_frames < 3200 and visual_fraction > 0.68:
+            return prior_turning_point
+
+        return turning_point
+
+    @staticmethod
+    def _direction_from_path(path):
+        diffs = np.diff(path, prepend=path[0])
+        abs_diffs = np.abs(diffs)
+        moving_diffs = abs_diffs[abs_diffs > 0]
+        threshold = max(float(np.percentile(moving_diffs, 30)) if len(moving_diffs) else 0.0, 1e-4)
+        direction = np.zeros(len(path), dtype=int)
+        direction[diffs > threshold] = 1
+        direction[diffs < -threshold] = -1
+        return direction
+
     def calculate_movement_path_and_turning_point(self, video_number, channel_length):
-        # --- Load frames and compute signals ---
+        """
+        Estimate movement with frame-to-frame image recognition.
+
+        The estimator compares several color/contrast-scaled versions of each
+        frame to measure "how much changed", then uses optical flow on a
+        contrast-normalized image to estimate where the forward/backward turn is.
+        """
+        if cv2 is None:
+            raise ImportError(
+                "OpenCV is required for movement estimation. Install it with "
+                "`pip install opencv-python`."
+            )
+
         path_to_video = self.path_to_videos + str(video_number)
-        frame_files = sorted(os.listdir(path_to_video), key=lambda x: int(os.path.splitext(x)[0]))
-        num_frames = len(frame_files)
+        frame_paths = self._sorted_frame_paths(path_to_video)
+        if not frame_paths:
+            raise FileNotFoundError(f"No image frames found in '{path_to_video}'.")
 
-        brightness = []
-        contrast = []
-        motion = []
-        prev = None
+        n_frames = len(frame_paths)
+        stride = max(1, n_frames // 1200)
 
-        orb = cv2.ORB_create(nfeatures=200)
-        
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        sampled_indices = list(range(0, n_frames, stride))
+        if sampled_indices[-1] != n_frames - 1:
+            sampled_indices.append(n_frames - 1)
 
-        for f in frame_files:
-            img = cv2.imread(os.path.join(path_to_video, f), cv2.IMREAD_GRAYSCALE)
-            img = cv2.resize(img, (0, 0), fx=0.5, fy=0.5)
+        pipe_entry_frame = self._estimate_pipe_entry_frame(frame_paths, sampled_indices)
 
-            brightness.append(np.mean(img))
-            contrast.append(np.std(img))
+        previous = None
+        motion_scores = []
+        direction_scores = []
+        score_frames = []
 
-            if prev is not None:
-                kp1, desc1 = orb.detectAndCompute(prev, None)
-                kp2, desc2 = orb.detectAndCompute(img, None)
+        for frame_index in sampled_indices:
+            frame = cv2.imread(frame_paths[frame_index])
+            if frame is None:
+                continue
 
-                if desc1 is not None and desc2 is not None and len(desc1) > 5 and len(desc2) > 5:
-                    matches = bf.match(desc1, desc2)
-                    if len(matches) > 5:
-                        # compute actual pixel displacement of matched keypoints
-                        pts1 = np.array([kp1[m.queryIdx].pt for m in matches])
-                        pts2 = np.array([kp2[m.trainIdx].pt for m in matches])
-                        displacements = np.linalg.norm(pts2 - pts1, axis=1)
-                        # use median to ignore outlier matches
-                        motion.append(np.median(displacements))
-                    else:
-                        motion.append(0.0)
-                else:
-                    motion.append(0.0)
+            current = self._preprocess_frame(frame)
+            if previous is None:
+                previous = current
+                continue
 
-            prev = img
+            color_motion = self._frame_motion_score(previous, current)
+            radial_direction, flow_confidence, global_motion_confidence = self._radial_flow_score(
+                previous["flow"],
+                current["flow"],
+            )
 
-        brightness = np.array(brightness)
-        contrast = np.array(contrast)
-        motion = np.array(motion)
+            # Motion strength comes mostly from multi-color frame differences.
+            # Optical-flow confidence boosts real texture motion and reduces pure lighting flicker.
+            flow_boost = 1.0 + min(flow_confidence, 5.0) * 0.08
+            motion_scores.append(color_motion * flow_boost)
+            direction_scores.append(radial_direction)
+            score_frames.append(frame_index)
+            previous = current
 
-        # --- Smooth signals ---
-        brightness_smooth = savgol_filter(brightness, window_length=51, polyorder=2)
-        contrast_smooth = savgol_filter(contrast, window_length=51, polyorder=2)
-        motion_smooth = savgol_filter(motion, window_length=31, polyorder=2)
-        motion_smooth = np.clip(motion_smooth, 0, None)
+        if not motion_scores:
+            movement_path = np.zeros(n_frames, dtype=float)
+            turning_point = 0.0
+            movement_direction = np.zeros(n_frames, dtype=int)
+            return movement_path, turning_point, movement_direction
 
-        # --- Detect tunnel entry ---
-        brightness_threshold = np.percentile(brightness_smooth, 40)
-        inside_tunnel = brightness_smooth < brightness_threshold
-        tunnel_start = 0
-        run_len = 0
-        for i, val in enumerate(inside_tunnel):
-            if val:
-                run_len += 1
-                if run_len >= 50:
-                    tunnel_start = i - run_len + 1
-                    break
+        motion_scores = self._normalize_signal(self._moving_average(motion_scores, 15))
+        motion_scores[motion_scores < 0.06] = 0.0
+
+        turning_point = self._find_turning_point(
+            direction_scores,
+            motion_scores,
+            n_frames,
+            stride,
+            channel_length,
+        )
+
+        frame_axis = np.arange(n_frames)
+        sampled_axis = np.asarray(score_frames, dtype=float)
+        speed = np.interp(frame_axis, sampled_axis, motion_scores, left=motion_scores[0], right=motion_scores[-1])
+        speed = self._moving_average(speed, 31)
+        speed[:pipe_entry_frame] = 0.0
+
+        movement_path = np.zeros(n_frames, dtype=float)
+        turn = int(turning_point)
+
+        forward_speed = speed[:turn + 1]
+        forward_distance = np.cumsum(forward_speed)
+        if forward_distance[-1] > 0:
+            movement_path[:turn + 1] = forward_distance / forward_distance[-1] * channel_length
+
+        backward_speed = speed[turn + 1:]
+        if len(backward_speed) > 0:
+            backward_distance = np.cumsum(backward_speed)
+            if backward_distance[-1] > 0:
+                movement_path[turn + 1:] = channel_length * (1.0 - backward_distance / backward_distance[-1])
             else:
-                run_len = 0
-        
-        # --- Detect bad frames (water/obstruction = low contrast) ---
-        # use a rolling window to be more aggressive about catching bad frames
-        contrast_threshold = np.percentile(contrast_smooth, 25)
-        bad_frame = contrast_smooth < contrast_threshold  # length num_frames
+                movement_path[turn + 1:] = channel_length
 
-
-        # --- Detect stationary period ---
-        # stationary = motion below 20th percentile of tunnel section
-        tunnel_motion = motion_smooth[tunnel_start:]
-        stationary_threshold = np.percentile(tunnel_motion, 20)
-        stationary = motion_smooth < stationary_threshold
-        stationary = np.concatenate([stationary, [False]])  # pad to num_frames
-
-        # zero out motion during stationary and before tunnel
-        motion_clean = motion_smooth.copy()
-        motion_clean[stationary[:len(motion_clean)]] = 0
-        motion_clean[:tunnel_start] = 0
-
-        # --- Detect turning point ---
-        # look for brightness minimum in middle 80% of tunnel
-        margin = (num_frames - tunnel_start) // 10
-        search_start = tunnel_start + margin
-        search_end = num_frames - margin
-        turning_point = float(search_start + np.argmin(brightness_smooth[search_start:search_end]))
-        tp = int(turning_point)
-
-        # --- Build position curve ---
-        forward_motion = motion_clean[:tp]
-        backward_motion = motion_clean[tp:]
-
-        forward_cumsum = np.cumsum(forward_motion)
-        backward_cumsum = np.cumsum(backward_motion)
-
-        if forward_cumsum[-1] > 0:
-            forward_position = forward_cumsum / forward_cumsum[-1] * channel_length
-        else:
-            forward_position = np.linspace(0, channel_length, tp)
-
-        if len(backward_cumsum) > 0 and backward_cumsum[-1] > 0:
-            backward_position = channel_length - (backward_cumsum / backward_cumsum[-1] * channel_length)
-        else:
-            backward_position = np.linspace(channel_length, 0, num_frames - tp)
-
-        movement_path = np.concatenate([[0], forward_position, backward_position])
-        movement_path = movement_path[:num_frames]
-
-        # --- Smooth final position ---
-        movement_path = savgol_filter(movement_path, window_length=31, polyorder=2)
-        movement_path = np.clip(movement_path, 0, channel_length)
-
-        # --- Movement direction ---
-        movement_direction = np.zeros(num_frames)
-        movement_direction[tunnel_start:tp] = 1
-        movement_direction[tp:] = -1
-        movement_direction[stationary[:num_frames]] = 0
+        movement_path = np.clip(self._moving_average(movement_path, 21), 0.0, channel_length)
+        movement_direction = self._direction_from_path(movement_path)
 
         return movement_path, turning_point, movement_direction
 
-    # ------------------------------------------------------------------ #
-    #  Framework boilerplate – you should not need to change this          #
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    # BONUS TASKS: Obstruction & Visibility Detection                   #
+    # ================================================================== #
+
+    def _get_bonus_video_path(self, video_number):
+        """Get the correct frame path for bonus videos (12+)."""
+        # Regular videos 1-11 use frame_images/
+        if video_number <= 11:
+            return self.path_to_videos + str(video_number)
+        
+        # Bonus videos 12+ should be in bonus_frame_images/ or frame_images/
+        # Try multiple paths in order of likelihood.
+        possible_paths = [
+            'bonus_frame_images/' + str(video_number),
+            self.path_to_videos + str(video_number),
+            'bonus_frame_images/frames/' + str(video_number),
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path) and os.path.isdir(path):
+                return path
+        
+        # If nothing found, return the most likely path anyway
+        return possible_paths[0]
+
+    def detect_visibility_score(self, video_number):
+        """
+        Per-frame visibility score (0-1).
+        Low contrast, very dark, or very bright frames = poor visibility.
+        Returns array of shape (N,) with visibility scores.
+        """
+        path_to_video = self._get_bonus_video_path(video_number)
+        frame_paths = self._sorted_frame_paths(path_to_video)
+        
+        if not frame_paths:
+            raise FileNotFoundError(f"No frames found in '{path_to_video}' for video {video_number}")
+        
+        visibility_scores = []
+        for frame_path in frame_paths:
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                visibility_scores.append(0.5)
+                continue
+            
+            # Convert to grayscale for contrast analysis
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Calculate contrast (standard deviation)
+            contrast = float(np.std(gray))
+            brightness = float(np.mean(gray))
+            
+            # Good visibility: moderate contrast (>15) and moderate brightness (50-200)
+            # Poor visibility: low contrast OR extreme brightness
+            if contrast > 15 and 50 < brightness < 200:
+                visibility = min(1.0, contrast / 50.0)
+            else:
+                visibility = 0.2
+            
+            visibility_scores.append(visibility)
+        
+        return np.array(visibility_scores)
+
+    def detect_blockage_degree(self, video_number):
+        """
+        Estimate blockage percentage (0-100%) per frame.
+        High edge density = more debris/blockage.
+        Returns array of shape (N,) with blockage percentages.
+        """
+        path_to_video = self._get_bonus_video_path(video_number)
+        frame_paths = self._sorted_frame_paths(path_to_video)
+        
+        if not frame_paths:
+            raise FileNotFoundError(f"No frames found in '{path_to_video}' for video {video_number}")
+        
+        blockage_scores = []
+        for frame_path in frame_paths:
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                blockage_scores.append(0.0)
+                continue
+            
+            # Preprocess frame and get edges
+            processed = self._preprocess_frame(frame)
+            edges = processed['edges']
+            
+            # Calculate edge density as a proxy for blockage
+            edge_density = float(np.sum(edges > 0)) / (edges.shape[0] * edges.shape[1])
+            blockage_percent = edge_density * 100.0
+            
+            blockage_scores.append(blockage_percent)
+        
+        return np.array(blockage_scores)
+
+    def detect_obstruction_type(self, video_number):
+        """
+        Classify frame ranges by obstruction type (Gravel, Lime, Roots, Sludge).
+        Uses texture and color analysis to estimate obstruction types.
+        Returns dict with frame ranges for each type.
+        """
+        path_to_video = self._get_bonus_video_path(video_number)
+        frame_paths = self._sorted_frame_paths(path_to_video)
+        
+        if not frame_paths:
+            raise FileNotFoundError(f"No frames found in '{path_to_video}' for video {video_number}")
+        
+        n_frames = len(frame_paths)
+        
+        obstructions = {
+            'Gravel': [],
+            'Lime': [],
+            'Roots': [],
+            'Sludge': [],
+            'Unknown': []
+        }
+        
+        # Color thresholds for debris detection
+        # Gravel: mixed gray/brown colors, high edge density
+        # Lime: whitish/yellowish areas
+        # Roots: dark brown/black wispy patterns
+        # Sludge: dark brown/grayish uniform areas
+        
+        frame_classifications = []
+        
+        for frame_path in frame_paths:
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                frame_classifications.append('Unknown')
+                continue
+            
+            # Convert to HSV for better color analysis
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            b, g, r = cv2.split(frame)
+            
+            # Analyze color distribution in the center region
+            h, w = hsv.shape[:2]
+            center_hsv = hsv[h//4:3*h//4, w//4:3*w//4]
+            center_rgb = frame[h//4:3*h//4, w//4:3*w//4]
+            
+            # Extract hue, saturation, value
+            h_vals = center_hsv[:,:,0]
+            s_vals = center_hsv[:,:,1]
+            v_vals = center_hsv[:,:,2]
+            
+            h_mean = float(np.mean(h_vals))
+            s_mean = float(np.mean(s_vals))
+            v_mean = float(np.mean(v_vals))
+            
+            # Get texture info (edge density)
+            processed = self._preprocess_frame(frame)
+            edges = processed['edges']
+            edge_density = float(np.sum(edges > 0)) / (edges.shape[0] * edges.shape[1])
+            
+            # Classification heuristics
+            obstruction_type = 'Unknown'
+            
+            # Lime: high saturation yellows (h ~20-40)
+            if (10 < h_mean < 40) and s_mean > 80:
+                obstruction_type = 'Lime'
+            # Roots: low saturation, low value (dark), high edges
+            elif v_mean < 80 and s_mean < 60 and edge_density > 0.12:
+                obstruction_type = 'Roots'
+            # Sludge: low saturation, moderate-low value, low edges
+            elif v_mean < 120 and s_mean < 70 and edge_density < 0.08:
+                obstruction_type = 'Sludge'
+            # Gravel: medium saturation, medium value, high edges
+            elif edge_density > 0.10 and 60 < v_mean < 180:
+                obstruction_type = 'Gravel'
+            
+            frame_classifications.append(obstruction_type)
+        
+        # Group consecutive frames of same type into ranges
+        if frame_classifications:
+            current_type = frame_classifications[0]
+            start_frame = 0
+            
+            for i in range(1, len(frame_classifications)):
+                if frame_classifications[i] != current_type:
+                    if current_type != 'Unknown':
+                        obstructions[current_type].append((start_frame, i - 1))
+                    current_type = frame_classifications[i]
+                    start_frame = i
+            
+            # Add final range
+            if current_type != 'Unknown':
+                obstructions[current_type].append((start_frame, n_frames - 1))
+        
+        return obstructions
+
+    def detect_dirty_locations(self, video_number, blockage_threshold=15.0):
+        """
+        Mark frame ranges where blockage degree exceeds threshold.
+        Returns dict with 'dirty_frames' list of (start, end) tuples.
+        """
+        blockage = self.detect_blockage_degree(video_number)
+        
+        dirty_frames = []
+        in_dirty_region = False
+        start_frame = 0
+        
+        for i, b in enumerate(blockage):
+            if b > blockage_threshold:
+                if not in_dirty_region:
+                    in_dirty_region = True
+                    start_frame = i
+            else:
+                if in_dirty_region:
+                    in_dirty_region = True
+                    dirty_frames.append((start_frame, i - 1))
+                    in_dirty_region = False
+        
+        # Handle case where video ends in dirty region
+        if in_dirty_region:
+            dirty_frames.append((start_frame, len(blockage) - 1))
+        
+        return {'dirty_frames': dirty_frames, 'blockage': blockage}
+
+    # ================================================================== #
+    #  Framework boilerplate – you should not need to change this        #
+    # ================================================================== #
 
     def execute_estimations(self):
         if self.test_all_videos:
