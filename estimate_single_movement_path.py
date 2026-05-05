@@ -6,7 +6,7 @@ from MovementPath import MovementPath
 from mySolution.MovementPathEstimator import MovementPathEstimator
 
 # ---- configure which video to run ----
-video_num_to_test = 2
+video_num_to_test = 1
 # --------------------------------------
 
 estimator = MovementPathEstimator(video_num_to_test, False)

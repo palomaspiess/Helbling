@@ -55,6 +55,7 @@ class MovementPathEstimator:
         prev = None
 
         orb = cv2.ORB_create(nfeatures=200)
+        
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
         for f in frame_files:
@@ -71,9 +72,11 @@ class MovementPathEstimator:
                 if desc1 is not None and desc2 is not None and len(desc1) > 5 and len(desc2) > 5:
                     matches = bf.match(desc1, desc2)
                     if len(matches) > 5:
+                        # compute actual pixel displacement of matched keypoints
                         pts1 = np.array([kp1[m.queryIdx].pt for m in matches])
                         pts2 = np.array([kp2[m.trainIdx].pt for m in matches])
                         displacements = np.linalg.norm(pts2 - pts1, axis=1)
+                        # use median to ignore outlier matches
                         motion.append(np.median(displacements))
                     else:
                         motion.append(0.0)
@@ -84,7 +87,7 @@ class MovementPathEstimator:
 
         brightness = np.array(brightness)
         contrast = np.array(contrast)
-        motion = np.array(motion)  # length num_frames - 1
+        motion = np.array(motion)
 
         # --- Smooth signals ---
         brightness_smooth = savgol_filter(brightness, window_length=51, polyorder=2)
@@ -105,49 +108,32 @@ class MovementPathEstimator:
                     break
             else:
                 run_len = 0
-
+        
         # --- Detect bad frames (water/obstruction = low contrast) ---
         # use a rolling window to be more aggressive about catching bad frames
         contrast_threshold = np.percentile(contrast_smooth, 25)
         bad_frame = contrast_smooth < contrast_threshold  # length num_frames
 
-        # --- Detect stationary periods ---
+
+        # --- Detect stationary period ---
+        # stationary = motion below 20th percentile of tunnel section
         tunnel_motion = motion_smooth[tunnel_start:]
         stationary_threshold = np.percentile(tunnel_motion, 20)
-        stationary = motion_smooth < stationary_threshold  # length num_frames - 1
+        stationary = motion_smooth < stationary_threshold
         stationary = np.concatenate([stationary, [False]])  # pad to num_frames
 
-        # --- Detect turning point using motion signal ---
-        # turning point = longest stationary run in middle 60% of tunnel
-        # (avoid edges where insertion/extraction cause false stationary periods)
-        margin = (num_frames - tunnel_start) // 5  # 20% margins, tighter than before
-        search_start = tunnel_start + margin
-        search_end = num_frames - margin
-
-        search_stationary = stationary[search_start:search_end]
-        best_start, best_len, curr_start, curr_len = 0, 0, 0, 0
-        for i, val in enumerate(search_stationary):
-            if val:
-                if curr_len == 0:
-                    curr_start = i
-                curr_len += 1
-                if curr_len > best_len:
-                    best_len = curr_len
-                    best_start = curr_start
-            else:
-                curr_len = 0
-
-        # turning point is the END of the longest stationary run
-        # (camera starts moving again after the pause)
-        turning_point = float(search_start + best_start + best_len)
-        tp = int(turning_point)
-
-        # --- Clean motion signal ---
+        # zero out motion during stationary and before tunnel
         motion_clean = motion_smooth.copy()
         motion_clean[stationary[:len(motion_clean)]] = 0
         motion_clean[:tunnel_start] = 0
-        # also zero out bad frames (water splashes etc)
-        motion_clean[bad_frame[:len(motion_clean)]] = 0
+
+        # --- Detect turning point ---
+        # look for brightness minimum in middle 80% of tunnel
+        margin = (num_frames - tunnel_start) // 10
+        search_start = tunnel_start + margin
+        search_end = num_frames - margin
+        turning_point = float(search_start + np.argmin(brightness_smooth[search_start:search_end]))
+        tp = int(turning_point)
 
         # --- Build position curve ---
         forward_motion = motion_clean[:tp]
@@ -170,14 +156,13 @@ class MovementPathEstimator:
         movement_path = movement_path[:num_frames]
 
         # --- Smooth final position ---
-        movement_path = savgol_filter(movement_path, window_length=51, polyorder=2)
+        movement_path = savgol_filter(movement_path, window_length=31, polyorder=2)
         movement_path = np.clip(movement_path, 0, channel_length)
 
         # --- Movement direction ---
         movement_direction = np.zeros(num_frames)
         movement_direction[tunnel_start:tp] = 1
         movement_direction[tp:] = -1
-        movement_direction[bad_frame[:num_frames]] = 0
         movement_direction[stationary[:num_frames]] = 0
 
         return movement_path, turning_point, movement_direction
