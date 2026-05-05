@@ -50,48 +50,46 @@ class MovementPathEstimator:
 
         frames = []
         for f in frame_files:
-            img = cv2.imread(os.path.join(path_to_video, f), cv2.IMREAD_GRAYSCALE)
-            img = cv2.resize(img, (0, 0), fx=0.5, fy=0.5)  # half resolution
-            frames.append(img)
+            img = Image.open(os.path.join(path_to_video, f)).convert("L")
+            frames.append(np.array(img, dtype=np.float32))
 
         num_frames = len(frames)
 
-        # --- Optical flow: measure motion magnitude between consecutive frames ---
-        motion = []
-        for i in range(num_frames - 1):
-            flow = cv2.calcOpticalFlowFarneback(
-                frames[i], frames[i + 1], None,
-                pyr_scale=0.5, levels=2, winsize=9,
-                iterations=2, poly_n=5, poly_sigma=1.2, flags=0
-            )
-            magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-            motion.append(np.mean(magnitude))
+        # --- Measure motion between consecutive frames ---
+        motion = np.array([
+            np.mean(np.abs(frames[i + 1] - frames[i]))
+            for i in range(num_frames - 1)
+        ])
 
-        motion = np.array(motion)
+        # --- Smooth motion signal (savgol preserves shape better than moving average) ---
+        motion_smooth = savgol_filter(motion, window_length=31, polyorder=2)
+        motion_smooth = np.clip(motion_smooth, 0, None)
 
-        # --- Smooth motion signal ---
-        motion_smooth = savgol_filter(motion, window_length=21, polyorder=2)
-        motion_smooth = np.clip(motion_smooth, 0, None)  # no negative values
-
-        # --- Detect stationary zones (where motion drops below threshold) ---
-        threshold = np.percentile(motion_smooth, 20)  # bottom 20% = likely stationary
-        stationary = motion_smooth < threshold
-        stationary = np.concatenate([stationary, [False]])
-
-
-        # --- Find turning point (lowest motion in middle 80% of video) ---
+        # --- Find turning point: look for the longest low-motion zone in middle 80% ---
         margin = num_frames // 10
-        search_region = motion_smooth[margin:-margin]
-        turning_point = float(np.argmin(search_region) + margin)
+        search = motion_smooth[margin:-margin]
+        threshold = np.percentile(search, 30)
+        low_motion = search < threshold
+
+        # find the center of the longest consecutive low-motion run
+        best_start, best_len, curr_start, curr_len = 0, 0, 0, 0
+        for i, val in enumerate(low_motion):
+            if val:
+                if curr_len == 0:
+                    curr_start = i
+                curr_len += 1
+                if curr_len > best_len:
+                    best_len = curr_len
+                    best_start = curr_start
+            else:
+                curr_len = 0
+
+        turning_point = float(margin + best_start + best_len // 2)
         tp = int(turning_point)
 
-        # --- Build position curve from cumulative motion ---
-        forward_motion = motion_smooth[:tp].copy()
-        backward_motion = motion_smooth[tp:].copy()
-
-        # zero out stationary frames so they don't accumulate position
-        forward_motion[stationary[:len(forward_motion)]] = 0
-        backward_motion[stationary[tp:tp + len(backward_motion)]] = 0
+        # --- Build position curve ---
+        forward_motion = motion_smooth[:tp]
+        backward_motion = motion_smooth[tp:]
 
         forward_cumsum = np.cumsum(forward_motion)
         backward_cumsum = np.cumsum(backward_motion)
@@ -109,16 +107,11 @@ class MovementPathEstimator:
         movement_path = np.concatenate([[0], forward_position, backward_position])
         movement_path = movement_path[:num_frames]
 
-        # --- Final smooth of position curve ---
-        movement_path = savgol_filter(movement_path, window_length=21, polyorder=2)
-        movement_path = np.clip(movement_path, 0, channel_length)
-
-        # --- Movement direction (0 when stationary) ---
+        # --- Movement direction ---
         movement_direction = np.concatenate([
             np.ones(tp),
             -np.ones(num_frames - tp)
         ])
-        movement_direction[stationary[:num_frames]] = 0
 
         return movement_path, turning_point, movement_direction
 
